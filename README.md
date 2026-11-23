@@ -16,13 +16,13 @@ An open-source **ESP32-based Wi-Fi Web Server, Infrared (IR) Transmitter/Receive
 - **Built-In IR Remote Code Capture (`GPIO 15`):** Uses a **TSOP38238** 38 kHz IR receiver module to decode and print any unknown remote button's protocol, address, and command hex values to the Serial Monitor (`115200` baud).
 - **Galvanically Isolated 24V AC Activity Sensing (`GPIO 5`):** Monitors a mechanical 24V AC coil relay across the rotator control box's AC output to display live active/idle power state on the web dashboard.
 - **Responsive Mobile & Desktop Web UI (Port `80`):** Displays live `rotctld` connection state, target satellite Azimuth and Elevation, commanded 3-digit rotator heading, 24V AC status badge, direct heading input, cardinal presets, and CW/CCW jog controls.
+<img width="1024" height="576" alt="RotorControl" src="https://github.com/user-attachments/assets/9a498918-45eb-4830-adc4-adc70f899007" />
 
 ---
 
 ## System Architecture & Signal Flow
 
 ```text
-<img width="1024" height="576" alt="RotorControl" src="https://github.com/user-attachments/assets/10534e43-0d4b-47bb-a787-50dec882ffa6" />
 
 +-----------------------------------+       Wi-Fi TCP :4533       +-----------------------------------+
 |  Satellite Tracking Software      | --------------------------> |  ESP32 Controller                 |
