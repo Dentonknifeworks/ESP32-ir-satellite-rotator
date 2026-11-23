@@ -22,6 +22,8 @@ An open-source **ESP32-based Wi-Fi Web Server, Infrared (IR) Transmitter/Receive
 ## System Architecture & Signal Flow
 
 ```text
+<img width="1024" height="576" alt="RotorControl" src="https://github.com/user-attachments/assets/10534e43-0d4b-47bb-a787-50dec882ffa6" />
+
 +-----------------------------------+       Wi-Fi TCP :4533       +-----------------------------------+
 |  Satellite Tracking Software      | --------------------------> |  ESP32 Controller                 |
 |  (SkyRoof / Gpredict)             |   Hamlib rotctld (P az el)  |  - Hamlib rotctld Server (:4533)  |
