@@ -1,13 +1,12 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <esp_wifi.h>
 #include "secrets.h"
 
-// Define pins before including IRremote.hpp
-#define IR_RECEIVE_PIN  15  // TSOP38238 Data Pin (G15 / D15)
+// Pin definitions
 #define IR_SEND_PIN     4   // TSAL6100 Driver Pin (G4 / D4)
 #define RELAY_SENSE_PIN 5   // Connected to Relay NO (Relay COM connected to ESP32 GND)
 #define STATUS_LED_PIN  18  // Optional external LED (+ 220 ohm resistor)
-#include <IRremote.hpp>
 
 // ==========================================
 // 1. WI-FI & SATELLITE TRACKING SETTINGS
@@ -102,11 +101,11 @@ void sendNecByte(uint8_t b) {
 }
 
 void sendNecCode(uint8_t command, uint8_t repeats = 0) {
-  // Pause IR receiver timer ISR during TX so 562us/1687us pulses stay exact
-  IrReceiver.stop();
-
   uint8_t addrLow  = NEC_ADDR & 0xFF;
   uint8_t addrHigh = (NEC_ADDR > 0xFF) ? (NEC_ADDR >> 8) : (~addrLow & 0xFF);
+
+  // Disable interrupts briefly during each 67ms NEC frame for exact 38kHz timing
+  noInterrupts();
 
   carrierOn(9000);
   carrierOff(4500);
@@ -119,17 +118,19 @@ void sendNecCode(uint8_t command, uint8_t repeats = 0) {
   carrierOn(562);
   carrierOff(0);
 
+  interrupts();
+
   for (uint8_t r = 0; r < repeats; r++) {
     delay(40);
+    noInterrupts();
     carrierOn(9000);
     carrierOff(2250);
     carrierOn(562);
     carrierOff(0);
+    interrupts();
   }
 
-  IrReceiver.start();
   lastIrSentMs = millis();
-
   yield();
   delay(80);
   yield();
@@ -146,11 +147,10 @@ void sendHeading(int heading, String sourceTag = "") {
   if (lastIrSentMs == 0 || (millis() - lastIrSentMs) > BOX_WAKE_TIMEOUT_MS) {
     int wakeDigit = buf[0] - '0';
     sendNecCode(CMD_DIGITS[wakeDigit], 0);
-    // Keep web server & rotctld responsive during wake delay
     unsigned long wakeStart = millis();
     while (millis() - wakeStart < 4500) {
       server.handleClient();
-      delay(10);
+      delay(15);
     }
   }
 
@@ -169,7 +169,7 @@ void sendHeading(int heading, String sourceTag = "") {
 }
 
 int angularDiff(int a, int b) {
-  if (b < 0) return 180; // Force initial move if no heading sent yet
+  if (b < 0) return 180;
   int d = abs(a - b) % 360;
   return (d > 180) ? (360 - d) : d;
 }
@@ -178,14 +178,12 @@ int angularDiff(int a, int b) {
 // 5. HAMLIB ROTCTLD HANDLER (SkyRoof / Gpredict)
 // ==========================================
 void handleRotctl() {
-  // Always accept a fresh client connection if one arrives (replaces stale sockets)
   WiFiClient newClient = rotctlServer.available();
   if (newClient) {
     if (rotctlClient && rotctlClient.connected()) {
       rotctlClient.stop();
     }
     rotctlClient = newClient;
-    rotctlClient.setNoDelay(true);
     hasPrePointedAOS = false;
     Serial.println("Satellite tracker connected to rotctld (port 4533)");
   }
@@ -196,7 +194,6 @@ void handleRotctl() {
 
   bool gotNewPos = false;
 
-  // Drain all buffered commands so we always act on the LATEST Az/El
   while (rotctlClient.available()) {
     String cmd = rotctlClient.readStringUntil('\n');
     cmd.trim();
@@ -212,6 +209,13 @@ void handleRotctl() {
       if (firstSpace > 0 && secondSpace > firstSpace) {
         satTargetAz = cmd.substring(firstSpace + 1, secondSpace).toFloat();
         satTargetEl = cmd.substring(secondSpace + 1).toFloat();
+
+        // Auto-unflip overhead pass coordinates if tracker sends El > 90 deg
+        if (satTargetEl > 90.0 && satTargetEl <= 180.0) {
+          satTargetEl = 180.0 - satTargetEl;
+          satTargetAz = fmod(satTargetAz + 180.0, 360.0);
+        }
+
         satDataReceived = true;
         gotNewPos = true;
         rotctlClient.println("RPRT 0");
@@ -227,7 +231,6 @@ void handleRotctl() {
       return;
     }
     else if (cmd == "\\dump_state") {
-      // Standard Hamlib dummy/rotctld dump_state response for strict clients
       rotctlClient.println("0\n2\n0.0\n360.0\n0.0\n0.0");
     }
     else {
@@ -409,7 +412,7 @@ void handleRoot() {
             prevAck = data.ack;
           }
         });
-    }, 1500);
+    }, 2000);
   </script>
 </body>
 </html>
@@ -459,17 +462,19 @@ void setup() {
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
 
-  IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
-
   ledcAttach(IR_SEND_PIN, 38000, 8);
   ledcWrite(IR_SEND_PIN, 0);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  // Lower Wi-Fi TX power (11 dBm) to minimize 3.3V rail spikes & RF hash near SDR
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
   server.on("/", handleRoot);
@@ -480,21 +485,11 @@ void setup() {
   server.begin();
 
   rotctlServer.begin();
-  rotctlServer.setNoDelay(true);
   Serial.println("Hamlib rotctld server listening on port 4533");
 }
 
 void loop() {
   server.handleClient();
   handleRotctl();
-
-  if (IrReceiver.decode()) {
-    if (IrReceiver.decodedIRData.protocol != UNKNOWN) {
-      Serial.printf("Captured IR -> Protocol: %s | Address: 0x%X | Command: 0x%X\n",
-                    getProtocolString(IrReceiver.decodedIRData.protocol),
-                    IrReceiver.decodedIRData.address,
-                    IrReceiver.decodedIRData.command);
-    }
-    IrReceiver.resume();
-  }
+  delay(5);
 }
