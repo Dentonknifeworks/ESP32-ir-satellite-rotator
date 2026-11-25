@@ -44,13 +44,16 @@ const uint8_t CMD_DIGITS[10] = {
   0x00, 0x01, 0x02, 0x03, 0x04,
   0x05, 0x06, 0x07, 0x08, 0x09
 };
-bool headingControllerWoken = false;
+
+// Re-wake Channel Master box if idle longer than 45 seconds
+const unsigned long BOX_WAKE_TIMEOUT_MS = 45000;
+unsigned long lastIrSentMs = 0;
 
 // ==========================================
 // 3. SERVER, RELAY SENSE & FEEDBACK STATE
 // ==========================================
 WebServer server(80);
-int lastHeading = 0;
+int lastHeading = -1;
 unsigned long cmdCount = 0;
 String lastAck = "Waiting for command...";
 
@@ -64,7 +67,7 @@ bool is24VACDetected() {
 
 void blinkConfirm() {
   digitalWrite(STATUS_LED_PIN, HIGH);
-  delay(120);
+  delay(100);
   digitalWrite(STATUS_LED_PIN, LOW);
 }
 
@@ -99,6 +102,9 @@ void sendNecByte(uint8_t b) {
 }
 
 void sendNecCode(uint8_t command, uint8_t repeats = 0) {
+  // Pause IR receiver timer ISR during TX so 562us/1687us pulses stay exact
+  IrReceiver.stop();
+
   uint8_t addrLow  = NEC_ADDR & 0xFF;
   uint8_t addrHigh = (NEC_ADDR > 0xFF) ? (NEC_ADDR >> 8) : (~addrLow & 0xFF);
 
@@ -121,6 +127,9 @@ void sendNecCode(uint8_t command, uint8_t repeats = 0) {
     carrierOff(0);
   }
 
+  IrReceiver.start();
+  lastIrSentMs = millis();
+
   yield();
   delay(80);
   yield();
@@ -133,11 +142,16 @@ void sendHeading(int heading, String sourceTag = "") {
   char buf[4];
   snprintf(buf, sizeof(buf), "%03d", heading);
 
-  if (!headingControllerWoken) {
+  // Wake Channel Master box if never woken or idle > 45s
+  if (lastIrSentMs == 0 || (millis() - lastIrSentMs) > BOX_WAKE_TIMEOUT_MS) {
     int wakeDigit = buf[0] - '0';
     sendNecCode(CMD_DIGITS[wakeDigit], 0);
-    delay(5000);
-    headingControllerWoken = true;
+    // Keep web server & rotctld responsive during wake delay
+    unsigned long wakeStart = millis();
+    while (millis() - wakeStart < 4500) {
+      server.handleClient();
+      delay(10);
+    }
   }
 
   delay(80);
@@ -155,6 +169,7 @@ void sendHeading(int heading, String sourceTag = "") {
 }
 
 int angularDiff(int a, int b) {
+  if (b < 0) return 180; // Force initial move if no heading sent yet
   int d = abs(a - b) % 360;
   return (d > 180) ? (360 - d) : d;
 }
@@ -163,22 +178,33 @@ int angularDiff(int a, int b) {
 // 5. HAMLIB ROTCTLD HANDLER (SkyRoof / Gpredict)
 // ==========================================
 void handleRotctl() {
-  if (!rotctlClient || !rotctlClient.connected()) {
-    WiFiClient newClient = rotctlServer.available();
-    if (newClient) {
-      rotctlClient = newClient;
-      hasPrePointedAOS = false;
-      Serial.println("Satellite tracker connected to rotctld (port 4533)");
+  // Always accept a fresh client connection if one arrives (replaces stale sockets)
+  WiFiClient newClient = rotctlServer.available();
+  if (newClient) {
+    if (rotctlClient && rotctlClient.connected()) {
+      rotctlClient.stop();
     }
+    rotctlClient = newClient;
+    rotctlClient.setNoDelay(true);
+    hasPrePointedAOS = false;
+    Serial.println("Satellite tracker connected to rotctld (port 4533)");
   }
 
-  if (rotctlClient && rotctlClient.connected() && rotctlClient.available()) {
+  if (!rotctlClient || !rotctlClient.connected() || !rotctlClient.available()) {
+    return;
+  }
+
+  bool gotNewPos = false;
+
+  // Drain all buffered commands so we always act on the LATEST Az/El
+  while (rotctlClient.available()) {
     String cmd = rotctlClient.readStringUntil('\n');
     cmd.trim();
-    if (cmd.length() == 0) return;
+    if (cmd.length() == 0) continue;
 
     if (cmd == "p" || cmd == "\\get_pos") {
-      rotctlClient.printf("%.1f\n0.0\n", (float)lastHeading);
+      float reportedAz = (lastHeading >= 0) ? (float)lastHeading : 0.0;
+      rotctlClient.printf("%.1f\n0.0\n", reportedAz);
     }
     else if (cmd.startsWith("P ") || cmd.startsWith("\\set_pos ")) {
       int firstSpace = cmd.indexOf(' ');
@@ -187,27 +213,8 @@ void handleRotctl() {
         satTargetAz = cmd.substring(firstSpace + 1, secondSpace).toFloat();
         satTargetEl = cmd.substring(secondSpace + 1).toFloat();
         satDataReceived = true;
-
-        int targetAz = (int)round(satTargetAz) % 360;
-        if (targetAz < 0) targetAz += 360;
-
+        gotNewPos = true;
         rotctlClient.println("RPRT 0");
-
-        // 1. Immediate AOS Pre-Point when satellite is below the horizon (El < 0)
-        if (satTargetEl < 0.0 && !hasPrePointedAOS && angularDiff(targetAz, lastHeading) >= 2) {
-          Serial.printf("AOS PRE-POINT -> Moving to %03d deg (El: %.1f)\n", targetAz, satTargetEl);
-          sendHeading(targetAz, "[AOS Pre-Point] ");
-          hasPrePointedAOS = true;
-        }
-        // 2. Active Pass Tracking (El >= 0) with 5-degree / 4-second deadband
-        else if (satTargetEl >= 0.0) {
-          hasPrePointedAOS = false;
-          if (angularDiff(targetAz, lastHeading) >= MIN_STEP_DEG &&
-              (millis() - lastSatSendMs) >= MIN_INTERVAL_MS) {
-            Serial.printf("SAT TRACK -> Target Az: %03d (El: %.1f)\n", targetAz, satTargetEl);
-            sendHeading(targetAz, "[SAT] ");
-          }
-        }
       } else {
         rotctlClient.println("RPRT -1");
       }
@@ -217,9 +224,35 @@ void handleRotctl() {
     }
     else if (cmd == "q" || cmd == "\\quit") {
       rotctlClient.stop();
+      return;
+    }
+    else if (cmd == "\\dump_state") {
+      // Standard Hamlib dummy/rotctld dump_state response for strict clients
+      rotctlClient.println("0\n2\n0.0\n360.0\n0.0\n0.0");
     }
     else {
       rotctlClient.println("RPRT 0");
+    }
+  }
+
+  if (gotNewPos) {
+    int targetAz = (int)round(satTargetAz) % 360;
+    if (targetAz < 0) targetAz += 360;
+
+    // 1. Immediate AOS Pre-Point when satellite is below the horizon (El < 0)
+    if (satTargetEl < 0.0 && !hasPrePointedAOS && angularDiff(targetAz, lastHeading) >= 2) {
+      Serial.printf("AOS PRE-POINT -> Moving to %03d deg (El: %.1f)\n", targetAz, satTargetEl);
+      sendHeading(targetAz, "[AOS Pre-Point] ");
+      hasPrePointedAOS = true;
+    }
+    // 2. Active Pass Tracking (El >= 0) with 5-degree / 4-second deadband
+    else if (satTargetEl >= 0.0) {
+      hasPrePointedAOS = false;
+      if (angularDiff(targetAz, lastHeading) >= MIN_STEP_DEG &&
+          (millis() - lastSatSendMs) >= MIN_INTERVAL_MS) {
+        Serial.printf("SAT TRACK -> Target Az: %03d (El: %.1f)\n", targetAz, satTargetEl);
+        sendHeading(targetAz, "[SAT] ");
+      }
     }
   }
 }
@@ -231,8 +264,12 @@ void handleStatus() {
   bool active = is24VACDetected();
   bool trackerConnected = (rotctlClient && rotctlClient.connected());
 
-  char cmdBuf[4];
-  snprintf(cmdBuf, sizeof(cmdBuf), "%03d", lastHeading);
+  char cmdBuf[5];
+  if (lastHeading >= 0) {
+    snprintf(cmdBuf, sizeof(cmdBuf), "%03d", lastHeading);
+  } else {
+    snprintf(cmdBuf, sizeof(cmdBuf), "---");
+  }
 
   String json = "{";
   json += "\"active\":" + String(active ? "true" : "false") + ",";
@@ -250,6 +287,7 @@ void handleRoot() {
   bool active = is24VACDetected();
   String pwrText  = active ? "24V AC DETECTED (Active)" : "NO 24V AC (Off / Idle)";
   String pwrColor = active ? "#2e7d32" : "#c62828";
+  int inputVal = (lastHeading >= 0) ? lastHeading : 0;
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -283,7 +321,7 @@ void handleRoot() {
   <div class="card">
     <h2>N0SSE Rotator Control</h2>
 
-    <div id="pwrBadge" class="pwr-badge">)rawliteral" + pwrText + R"rawliteral(</div>
+    <!-- <div id="pwrBadge" class="pwr-badge">)rawliteral" + pwrText + R"rawliteral(</div> -->
     <div id="ackBox" class="status">)rawliteral" + lastAck + R"rawliteral(</div>
 
     <div class="sat-box">
@@ -302,20 +340,21 @@ void handleRoot() {
         </div>
         <div class="sat-cell">
           <div class="sat-lbl">Rotator Cmd</div>
-          <div id="cmdHdg" class="sat-val">000&deg;</div>
+          <div id="cmdHdg" class="sat-val">---&deg;</div>
         </div>
       </div>
     </div>
 
-    <a href="/power"><button class="btn-pwr">Toggle Box Power (IR)</button></a>
+    <!-- <a href="/power"><button class="btn-pwr">Toggle Box Power (IR)</button></a> -->
 
     <form action="/set" method="GET">
-      <input type="number" name="deg" min="0" max="360" value=")rawliteral" + String(lastHeading) + R"rawliteral(" required>
+      <input type="number" name="deg" min="0" max="360" value=")rawliteral" + String(inputVal) + R"rawliteral(" required>
       <button type="submit" class="btn-go">Rotate</button>
     </form>
 
     <div class="presets">
       <a href="/set?deg=000"><button class="btn-pre">N (000&deg;)</button></a>
+      <a href="/set?deg=090"><button class="btn-pre">E (090&deg;)</button></a>
       <a href="/set?deg=180"><button class="btn-pre">S (180&deg;)</button></a>
       <a href="/set?deg=270"><button class="btn-pre">W (270&deg;)</button></a>
     </div>
@@ -335,12 +374,14 @@ void handleRoot() {
         .then(r => r.json())
         .then(data => {
           const badge = document.getElementById('pwrBadge');
-          if (data.active) {
-            badge.textContent = '24V AC DETECTED (Active)';
-            badge.style.background = '#2e7d32';
-          } else {
-            badge.textContent = 'NO 24V AC (Off / Idle)';
-            badge.style.background = '#c62828';
+          if (badge) {
+            if (data.active) {
+              badge.textContent = '24V AC DETECTED (Active)';
+              badge.style.background = '#2e7d32';
+            } else {
+              badge.textContent = 'NO 24V AC (Off / Idle)';
+              badge.style.background = '#c62828';
+            }
           }
 
           const trk = document.getElementById('trkState');
