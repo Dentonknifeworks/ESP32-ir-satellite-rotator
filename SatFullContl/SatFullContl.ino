@@ -44,6 +44,7 @@ const uint8_t CMD_DIGITS[10] = {
   0x00, 0x01, 0x02, 0x03, 0x04,
   0x05, 0x06, 0x07, 0x08, 0x09
 };
+bool headingControllerWoken = false;
 
 // ==========================================
 // 3. SERVER, RELAY SENSE & FEEDBACK STATE
@@ -131,6 +132,13 @@ void sendHeading(int heading, String sourceTag = "") {
 
   char buf[4];
   snprintf(buf, sizeof(buf), "%03d", heading);
+
+  if (!headingControllerWoken) {
+    int wakeDigit = buf[0] - '0';
+    sendNecCode(CMD_DIGITS[wakeDigit], 0);
+    delay(5000);
+    headingControllerWoken = true;
+  }
 
   delay(80);
   for (int i = 0; i < 3; i++) {

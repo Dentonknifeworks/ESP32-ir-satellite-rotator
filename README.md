@@ -102,6 +102,18 @@ An open-source **ESP32-based Wi-Fi Web Server, Infrared (IR) Transmitter/Receive
 3. Confirm the Channel Master NEC codes in `SatFullContl.ino` (default `NEC_ADDR = 0xAC`). If your remote uses different command bytes, open the **Serial Monitor at `115200` baud**, point your remote at the **TSOP38238 (`GPIO 15`)**, and press each button to read its exact hex values.
 4. Select **ESP32 Dev Module** and upload the sketch. Note the IP address printed in the Serial Monitor.
 
+### Build and Upload with PlatformIO
+
+The repository also includes `platformio.ini` for building the ESP32 Dev Module from the repository root. Install PlatformIO Core, connect the board over USB, then run:
+
+```sh
+pio run
+pio run -t upload
+pio device monitor --baud 115200
+```
+
+PlatformIO will detect the available serial port. If more than one port is connected, specify the ESP32 port with `--upload-port` and `--port`. Keep Wi-Fi credentials in the ignored `SatFullContl/secrets.h` file.
+
 ---
 
 ## Connecting Satellite Tracking Software
@@ -124,6 +136,7 @@ An open-source **ESP32-based Wi-Fi Web Server, Infrared (IR) Transmitter/Receive
 
 ## Channel Master Operation Notes
 
+- **Initial Wake-Up:** On the first heading command after the ESP32 starts, the controller sends the heading's first digit to wake the control box, waits five seconds, then sends the complete three-digit heading.
 - **Three-Digit Heading Format:** Channel Master digital control boxes require three digits for every heading entry (e.g., `090` for East rather than `90`). `sendHeading()` automatically zero-pads every heading (`%03d`) before transmitting the three NEC digit frames.
 - **North Mechanical Stop (`0° / 360°`):** Because TV antenna rotators use a mechanical end-stop at North (`0° / 360°`), any satellite pass crossing due North (`355° -> 005°`) will cause the rotator to unwind counter-clockwise around the dial.
 
